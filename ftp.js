@@ -15,7 +15,6 @@ var Events = require('./lib/events');
 var combine = require('./lib/stream-combiner');
 var ListingParser = require('./lib/parse-listing');
 var ResponseParser = require('./lib/ftp-response-parser');
-
 var debug = require('debug')('ftp:general');
 var dbgCommand = require('debug')('ftp:command');
 var dbgResponse = require('debug')('ftp:response');
@@ -35,6 +34,7 @@ var FTP_NEWLINE = /\r\n|\n/;
 
 function getPasvPort(text) {
   var match = RE_PASV.exec(text);
+
   if (!match) {
     return null;
   }
@@ -55,6 +55,7 @@ function runCmd() {
   }
 
   completeCmd += ' ' + args.join(' ');
+
   this.execute(completeCmd.trim(), callback);
 }
 
@@ -67,12 +68,12 @@ var FTP = module.exports = function(options) {
   // directory or retrieving file properties is quite a common operation, it is
   // more efficient to avoid the round-trip to the server.
   this.useList = options.useList || false;
-
   this.commandQueue = [];
 
   EventEmitter.call(this);
 
   var self = this;
+
   // Generate generic methods from parameter names. they can easily be
   // overriden if we need special behavior. they accept any parameters given,
   // it is the responsibility of the user to validate the parameters.
@@ -81,7 +82,6 @@ var FTP = module.exports = function(options) {
   };
 
   this.on('data', dbgResponse);
-
   this._createSocket(this.port, this.host);
 };
 
@@ -91,6 +91,7 @@ FTP.prototype = Object.create(Events.prototype, {
 
 FTP.prototype.reemit = function(event) {
   var self = this;
+
   return function(data) {
     self.emit(event, data);
     debug('event:' + event, data || {});
@@ -105,10 +106,12 @@ FTP.prototype._createSocket = function(port, host, firstAction) {
   if (this.resParser) {
     this.resParser.end();
   }
+
   this.resParser = new ResponseParser();
 
   this.authenticated = false;
   this.socket = Net.createConnection(port, host, firstAction || NOOP);
+
   this.socket.on('connect', this.reemit('connect'));
   this.socket.on('timeout', this.reemit('timeout'));
 
@@ -128,11 +131,13 @@ FTP.prototype.parseResponse = function(response) {
   if (this.commandQueue.length === 0) {
     return;
   }
+
   if ([220].indexOf(response.code) > -1) {
     return;
   }
 
   var next = this.commandQueue[0].callback;
+
   if (response.isMark) {
     // If we receive a Mark and it is not expected, we ignore that command
     if (!next.expectsMark
@@ -148,6 +153,7 @@ FTP.prototype.parseResponse = function(response) {
 
   if (this.ignoreCmdCode === response.code) {
     this.ignoreCmdCode = null;
+
     return;
   }
 
@@ -166,14 +172,15 @@ FTP.prototype.send = function(command) {
 
   dbgCommand(command);
   this.pipeline.write(command + '\r\n');
-
   dbgCommand(command);
 };
 
 FTP.prototype.nextCmd = function() {
   var cmd = this.commandQueue[0];
+
   if (!this.inProgress && cmd) {
     this.send(cmd.action);
+
     this.inProgress = true;
   }
 };
@@ -197,7 +204,9 @@ FTP.prototype.execute = function(action, callback) {
   }
 
   var self = this;
+
   this.authenticated = false;
+
   this._createSocket(this.port, this.host, function() {
     self.runCommand(action, callback || NOOP);
   });
@@ -212,10 +221,12 @@ FTP.prototype.runCommand = function(action, callback) {
   if (this.authenticated || /^(feat|syst|user|pass)/.test(action)) {
     this.commandQueue.push(cmd);
     this.nextCmd();
+
     return;
   }
 
   var self = this;
+
   this.getFeatures(function() {
     self.auth(self.user, self.pass, function() {
       self.commandQueue.push(cmd);
@@ -234,13 +245,16 @@ FTP.prototype.runCommand = function(action, callback) {
  */
 FTP.prototype.parse = function(response, command) {
   var error = null;
+
   if (response.isError) {
     error = new Error(response.text || 'Unknown FTP error.');
     error.code = response.code;
   }
 
   command.callback(error, response);
+
   this.inProgress = false;
+
   this.nextCmd();
 };
 
@@ -263,6 +277,7 @@ FTP.prototype.hasFeat = function(feature) {
 FTP.prototype._parseFeats = function(features) {
   // Split and ignore header and footer
   var featureLines = features.split(FTP_NEWLINE).slice(1, -1);
+
   return featureLines
     .map(function(feat) {
       return feat.trim().toLowerCase();
@@ -280,8 +295,10 @@ FTP.prototype.getFeatures = function(callback) {
   }
 
   var self = this;
+
   this.raw('feat', function(error, response) {
     self.features = error ? [] : self._parseFeats(response.text);
+
     self.raw('syst', function(error, response) {
       if (!error && response.code === 215) {
         self.system = response.text.toLowerCase();
@@ -309,15 +326,19 @@ FTP.prototype.auth = function(user, pass, callback) {
   if (!user) {
     user = 'anonymous';
   }
+
   if (!pass) {
     pass = '@anonymous';
   }
 
   this.authenticating = true;
+
   self.raw('user', user, function(error, response) {
     if (error || [230, 331, 332].indexOf(response.code) === -1) {
       self.authenticating = false;
+
       callback(error);
+
       return;
     }
     self.raw('pass', pass, function(error, response) {
@@ -329,6 +350,7 @@ FTP.prototype.auth = function(user, pass, callback) {
         self.authenticated = true;
         self.user = user;
         self.pass = pass;
+
         self.raw('type', 'I', function() {
           callback(undefined, response);
         });
@@ -341,11 +363,13 @@ FTP.prototype.auth = function(user, pass, callback) {
 
 FTP.prototype.setType = function(type, callback) {
   type = type.toUpperCase();
+
   if (this.type === type) {
     return callback();
   }
 
   var self = this;
+
   this.raw('type', type, function(error, data) {
     if (!error) {
       self.type = type;
@@ -378,6 +402,7 @@ FTP.prototype.list = function(path, callback) {
     }
 
     socket.setEncoding('utf8');
+
     socket.on('data', function(data) {
       listing += data;
     });
@@ -436,12 +461,14 @@ FTP.prototype.get = function(remotePath, localPath, callback) {
     finalCallback = once(localPath || NOOP);
   } else {
     callback = once(callback || NOOP);
+
     finalCallback = function(error, socket) {
       if (error) {
         return callback(error);
       }
 
       var writeStream = fs.createWriteStream(localPath);
+
       writeStream.on('error', callback);
 
       socket.on('readable', function() {
@@ -477,7 +504,9 @@ FTP.prototype.get = function(remotePath, localPath, callback) {
  */
 FTP.prototype.getGetSocket = function(path, callback) {
   var self = this;
+
   callback = once(callback);
+
   this.getPasvSocket(function(error, socket) {
     if (error) {
       return cmdCallback(error);
@@ -487,6 +516,7 @@ FTP.prototype.getGetSocket = function(path, callback) {
       if (error.code === 'ECONNREFUSED') {
         error.msg = 'Probably trying a PASV operation while one is in progress';
       }
+
       cmdCallback(error);
     });
 
@@ -510,6 +540,7 @@ FTP.prototype.getGetSocket = function(path, callback) {
     }
 
     cmdCallback.expectsMark = expectedMarks;
+
     self.execute('retr ' + path, cmdCallback);
   });
 };
@@ -559,9 +590,8 @@ FTP.prototype.put = function(from, to, callback) {
       }
 
       var totalSize = error ? 0 : stats.size;
-      var localFileStream = fs.createReadStream(from, {
-        bufferSize: 4 * 1024
-      });
+      var localFileStream = fs.createReadStream(from, { bufferSize: 4 * 1024 });
+
       putReadable(localFileStream, to, totalSize, callback);
     });
   } else { // `from` is a readable stream
@@ -619,6 +649,7 @@ FTP.prototype.getPutSocket = function(path, callback, doneCallback) {
 
 FTP.prototype.pasvTimeout = function(socket, callback) {
   var self = this;
+
   socket.once('timeout', function() {
     debug('PASV socket timeout');
     self.emit('timeout');
@@ -629,6 +660,7 @@ FTP.prototype.pasvTimeout = function(socket, callback) {
 
 FTP.prototype.getPasvSocket = function(callback) {
   var self = this;
+
   callback = once(callback || NOOP);
 
   this.execute('pasv', function(error, response) {
@@ -637,11 +669,13 @@ FTP.prototype.getPasvSocket = function(callback) {
     }
 
     var options = getPasvPort(response.text);
+
     if (!options) {
       return callback(new Error('Bad passive host/port combination'));
     }
 
     var socket = self._pasvSocket = Net.createConnection(options);
+
     socket.setTimeout(self.timeout || TIMEOUT);
     socket.once('close', function() {
       self._pasvSocket = undefined;
@@ -660,17 +694,17 @@ FTP.prototype.getPasvSocket = function(callback) {
  *
  * Example of file object:
  *
- *  {
- *      name: 'README.txt',
- *      type: 0,
- *      time: 996052680000,
- *      size: '2582',
- *      owner: 'sergi',
- *      group: 'staff',
- *      userPermissions: { read: true, write: true, exec: false },
- *      groupPermissions: { read: true, write: false, exec: false },
- *      otherPermissions: { read: true, write: false, exec: false }
- *  }
+ * {
+ *   name: 'README.txt',
+ *   type: 0,
+ *   time: 996052680000,
+ *   size: '2582',
+ *   owner: 'sergi',
+ *   group: 'staff',
+ *   userPermissions: { read: true, write: true, exec: false },
+ *   groupPermissions: { read: true, write: false, exec: false },
+ *   otherPermissions: { read: true, write: false, exec: false }
+ * }
  *
  * The constants used in the object are defined in ftpParser.js
  *
@@ -728,16 +762,19 @@ FTP.prototype.ls = function(filePath, callback) {
 
 FTP.prototype.rename = function(from, to, callback) {
   var self = this;
+
   this.raw('rnfr', from, function(error) {
     if (error) {
       return callback(error);
     }
+
     self.raw('rnto', to, callback);
   });
 };
 
 FTP.prototype.keepAlive = function(wait) {
   var self = this;
+
   if (this._keepAliveInterval) {
     clearInterval(this._keepAliveInterval);
   }
