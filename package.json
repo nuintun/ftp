@@ -17,9 +17,9 @@
   },
   "homepage": "https://github.com/nuintun/ftp",
   "dependencies": {
-    "wrappy": "^1.0.2",
     "debug": "^2.6.7",
     "unorm": "^1.4.1",
+    "wrappy": "^1.0.2",
     "readable-stream": "^2.2.9",
     "@nuintun/through": "https://github.com/nuintun/through/archive/master.tar.gz",
     "@nuintun/duplexer": "https://github.com/nuintun/duplexer/archive/master.tar.gz"

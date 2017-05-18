@@ -70,7 +70,7 @@ var FTP = module.exports = function(options) {
   this.useList = options.useList || false;
   this.commandQueue = [];
 
-  EventEmitter.call(this);
+  Events.call(this);
 
   var self = this;
 
@@ -115,7 +115,7 @@ FTP.prototype._createSocket = function(port, host, firstAction) {
   this.socket.on('connect', this.reemit('connect'));
   this.socket.on('timeout', this.reemit('timeout'));
 
-  this.pipeline = combine(this.socket, this.resParser);
+  this.pipeline = combine({ objectMode: true }, this.socket, this.resParser);
 
   var self = this;
 
