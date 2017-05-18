@@ -1,0 +1,27 @@
+{
+  "name": "ftp",
+  "version": "0.0.1",
+  "description": "A node ftp client.",
+  "main": "ftp.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuintun/ftp.git"
+  },
+  "keywords": [
+    "ftp"
+  ],
+  "author": "nuintun",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/nuintun/ftp/issues"
+  },
+  "homepage": "https://github.com/nuintun/ftp",
+  "dependencies": {
+    "wrappy": "^1.0.2",
+    "debug": "^2.6.7",
+    "unorm": "^1.4.1",
+    "readable-stream": "^2.2.9",
+    "@nuintun/through": "https://github.com/nuintun/through/archive/master.tar.gz",
+    "@nuintun/duplexer": "https://github.com/nuintun/duplexer/archive/master.tar.gz"
+  }
+}
