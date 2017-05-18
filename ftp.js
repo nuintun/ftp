@@ -60,6 +60,8 @@ function runCmd() {
 }
 
 var FTP = module.exports = function(options) {
+  var self = this;
+
   this.host = options.host || 'localhost';
   this.port = options.port || FTP_PORT;
   this.user = options.user || 'anonymous';
@@ -69,10 +71,6 @@ var FTP = module.exports = function(options) {
   // more efficient to avoid the round-trip to the server.
   this.useList = options.useList || false;
   this.commandQueue = [];
-
-  Events.call(this);
-
-  var self = this;
 
   // Generate generic methods from parameter names. they can easily be
   // overriden if we need special behavior. they accept any parameters given,
@@ -168,9 +166,7 @@ FTP.prototype.parseResponse = function(response) {
  * @param {String} command Command to write in the FTP socket
  */
 FTP.prototype.send = function(command) {
-  if (!command) {
-    return;
-  }
+  if (!command) return;
 
   dbgCommand(command);
   this.pipeline.write(command + '\r\n');
@@ -319,11 +315,11 @@ FTP.prototype.getFeatures = function(callback) {
  * @param {Function} callback Follow-up function.
  */
 FTP.prototype.auth = function(user, pass, callback) {
-  var self = this;
-
   if (this.authenticating === true) {
     return callback(new Error('This client is already authenticating'));
   }
+
+  var self = this;
 
   if (!user) {
     user = 'anonymous';
