@@ -92,7 +92,7 @@ FTP.prototype.reemit = function(event) {
 
   return function(data) {
     self.emit(event, data);
-    debug('event:' + event, data || {});
+    debug(' event:' + event, data || {});
   };
 };
 
@@ -168,9 +168,9 @@ FTP.prototype.parseResponse = function(response) {
 FTP.prototype.send = function(command) {
   if (!command) return;
 
-  dbgCommand(command);
+  dbgCommand(' ' + command);
+
   this.pipeline.write(command + '\r\n');
-  dbgCommand(command);
 };
 
 FTP.prototype.nextCmd = function() {
@@ -649,7 +649,7 @@ FTP.prototype.pasvTimeout = function(socket, callback) {
   var self = this;
 
   socket.once('timeout', function() {
-    debug('PASV socket timeout');
+    debug(' PASV socket timeout');
     self.emit('timeout');
     socket.end();
     callback(new Error('Passive socket timeout'));
