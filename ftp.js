@@ -801,3 +801,6 @@ FTP.prototype.destroy = function() {
   this.features = null;
   this.authenticated = false;
 };
+
+// Node types
+FTP.NODE_TYPES = ListingParser.nodeTypes;
