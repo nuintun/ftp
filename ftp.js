@@ -12,7 +12,7 @@ var Net = require('net');
 var unorm = require('unorm');
 var once = require('./lib/once');
 var Events = require('./lib/events');
-var duplexer = require('@nuintun/duplexer');
+var duplexer = require('./lib/duplexer');
 var ListingParser = require('./lib/parse-listing');
 var ResponseParser = require('./lib/ftp-response-parser');
 var debug = require('debug')('ftp:general');
@@ -99,6 +99,8 @@ FTP.prototype.reemit = function(event) {
 };
 
 FTP.prototype._createSocket = function(port, host, firstAction) {
+  var self = this;
+
   if (this.socket && this.socket.destroy) {
     this.socket.destroy();
   }
@@ -117,7 +119,7 @@ FTP.prototype._createSocket = function(port, host, firstAction) {
 
   this.pipeline = duplexer(this.socket, this.resParser);
 
-  var self = this;
+  this.socket.pipe(this.resParser);
 
   this.pipeline.on('data', function(data) {
     self.emit('data', data);
