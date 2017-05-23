@@ -17,7 +17,7 @@ var ListingParser = require('./lib/parse-listing');
 var ResponseParser = require('./lib/ftp-response-parser');
 var debug = require('debug')('ftp:general');
 var dbgCommand = require('debug')('ftp:command');
-var dbgResponse = require('debug')('ftp:response');
+var dbgRespond = require('debug')('ftp:respond');
 
 var FTP_PORT = 21;
 var TIMEOUT = 10 * 60 * 1000;
@@ -79,7 +79,7 @@ var FTP = module.exports = function(options) {
     return runCmd.apply(self, arguments);
   };
 
-  this.on('data', dbgResponse);
+  this.on('data', dbgRespond);
   this._createSocket(this.port, this.host);
 };
 
@@ -92,7 +92,7 @@ FTP.prototype.reemit = function(event) {
 
   return function(data) {
     self.emit(event, data);
-    debug(' event:' + event, data || {});
+    debug('%s: %O', event, data || {});
   };
 };
 
@@ -121,7 +121,7 @@ FTP.prototype._createSocket = function(port, host, firstAction) {
 
   this.pipeline.on('data', function(data) {
     self.emit('data', data);
-    dbgResponse(data.text);
+    dbgRespond(data.text);
     self.parseResponse(data);
   });
   this.pipeline.on('error', this.reemit('error'));
@@ -168,7 +168,7 @@ FTP.prototype.parseResponse = function(response) {
 FTP.prototype.send = function(command) {
   if (!command) return;
 
-  dbgCommand(' ' + command);
+  dbgCommand(command);
 
   this.pipeline.write(command + '\r\n');
 };
@@ -649,7 +649,7 @@ FTP.prototype.pasvTimeout = function(socket, callback) {
   var self = this;
 
   socket.once('timeout', function() {
-    debug(' PASV socket timeout');
+    debug('PASV socket timeout');
     self.emit('timeout');
     socket.end();
     callback(new Error('Passive socket timeout'));
