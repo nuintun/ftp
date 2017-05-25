@@ -1,6 +1,6 @@
 # ftp
 
-> node ftp modify from sergi/jsftp
+> node ftp modify from mscdex/node-ftp
 >
 >[![Dependencies][david-image]][david-url]
 

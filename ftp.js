@@ -1,806 +1,1277 @@
-/*
- * @package jsftp
- * @copyright Copyright(c) 2012 Ajax.org B.V. <info@c9.io>
- * @author Sergi Mansilla <sergi.mansilla@gmail.com>
- * @license https://github.com/sergi/jsFTP/blob/master/LICENSE MIT License
+/*!
+ * ftp
+ * Version: 0.0.1
+ * Date: 2016/8/1
+ * https://github.com/nuintun/ftp
+ *
+ * Original Author: https://github.com/mscdex/node-ftp
+ *
+ * This is licensed under the MIT License (MIT).
+ * For details, see: https://github.com/nuintun/ftp/blob/master/LICENSE
  */
 
-'use strict';
-
 var fs = require('fs');
-var Net = require('net');
-var unorm = require('unorm');
-var once = require('./lib/once');
+var tls = require('tls');
+var zlib = require('zlib');
+var XRegExp = require('xregexp');
+var Socket = require('net').Socket;
 var Events = require('./lib/events');
-var duplexer = require('./lib/duplexer');
-var ListingParser = require('./lib/parse-listing');
-var ResponseParser = require('./lib/ftp-response-parser');
-var debug = require('debug')('ftp:general');
-var dbgCommand = require('debug')('ftp:command');
-var dbgRespond = require('debug')('ftp:respond');
+var Parser = require('./lib/parser');
+var inspect = require('util').inspect;
+var StringDecoder = require('string_decoder').StringDecoder;
 
-var FTP_PORT = 21;
-var TIMEOUT = 10 * 60 * 1000;
-var IDLE_TIME = 30000;
-var NOOP = function() {};
+var REX_TIMEVAL = XRegExp.cache('^(?<year>\\d{4})(?<month>\\d{2})(?<date>\\d{2})(?<hour>\\d{2})(?<minute>\\d{2})(?<second>\\d+)(?:.\\d+)?$');
+var RE_PASV = /([\d]+),([\d]+),([\d]+),([\d]+),([-\d]+),([-\d]+)/;
+var RE_EOL = /\r?\n/g;
+var RE_WD = /"(.+)"(?: |$)/;
+var RE_SYST = /^([^ ]+)(?: |$)/;
 
-var expectedMarks = {
-  marks: [125, 150],
-  ignore: 226,
+var RETVAL = {
+  PRELIM: 1,
+  OK: 2,
+  WAITING: 3,
+  ERR_TEMP: 4,
+  ERR_PERM: 5
 };
 
-var RE_PASV = /([-\d]+,[-\d]+,[-\d]+,[-\d]+),([-\d]+),([-\d]+)/;
-var FTP_NEWLINE = /\r\n|\n/;
+var bytesNOOP = new Buffer('NOOP\r\n');
 
-function getPasvPort(text) {
-  var match = RE_PASV.exec(text);
-
-  if (!match) {
-    return null;
+var FTP = module.exports = function() {
+  if (!(this instanceof FTP)) {
+    return new FTP();
   }
 
-  return {
-    host: match[1].replace(/,/g, '.'),
-    port: (parseInt(match[2], 10) & 255) * 256 + (parseInt(match[3], 10) & 255),
+  this._socket = undefined;
+  this._pasvSock = undefined;
+  this._feat = undefined;
+  this._curReq = undefined;
+  this._queue = [];
+  this._secstate = undefined;
+  this._debug = undefined;
+  this._keepalive = undefined;
+  this._ending = false;
+  this._parser = undefined;
+  this.options = {
+    host: undefined,
+    port: undefined,
+    user: undefined,
+    password: undefined,
+    secure: false,
+    secureOptions: undefined,
+    connTimeout: undefined,
+    pasvTimeout: undefined,
+    aliveTimeout: undefined
   };
-}
-
-function runCmd() {
-  var callback = NOOP;
-  var args = [].slice.call(arguments);
-  var completeCmd = args.shift();
-
-  if (typeof args[args.length - 1] === 'function') {
-    callback = args.pop();
-  }
-
-  completeCmd += ' ' + args.join(' ');
-
-  this.execute(completeCmd.trim(), callback);
-}
-
-var FTP = module.exports = function(options) {
-  var self = this;
-
-  this.host = options.host || 'localhost';
-  this.port = options.port || FTP_PORT;
-  this.user = options.user || 'anonymous';
-  this.pass = options.pass || '@anonymous';
-  // True if the server doesn't support the `stat` command. Since listing a
-  // directory or retrieving file properties is quite a common operation, it is
-  // more efficient to avoid the round-trip to the server.
-  this.useList = options.useList || false;
-  this.commandQueue = [];
-
-  // Generate generic methods from parameter names. they can easily be
-  // overriden if we need special behavior. they accept any parameters given,
-  // it is the responsibility of the user to validate the parameters.
-  this.raw = function() {
-    return runCmd.apply(self, arguments);
-  };
-
-  this.on('data', dbgRespond);
-  this._createSocket(this.port, this.host);
+  this.connected = false;
 };
 
+// extend events
 FTP.prototype = Object.create(Events.prototype, {
   constructor: { value: FTP }
 });
 
-FTP.prototype.reemit = function(event) {
+FTP.prototype.connect = function(options) {
   var self = this;
 
-  return function(data) {
-    self.emit(event, data);
-    debug('%s: %O', event, data || {});
-  };
-};
-
-FTP.prototype._createSocket = function(port, host, firstAction) {
-  var self = this;
-
-  if (this.socket && this.socket.destroy) {
-    this.socket.destroy();
+  if (typeof options !== 'object') {
+    options = {};
   }
 
-  if (this.resParser) {
-    this.resParser.end();
+  this.connected = false;
+  this.options.host = options.host || 'localhost';
+  this.options.port = options.port || 21;
+  this.options.user = options.user || 'anonymous';
+  this.options.password = options.password || options.password === '' ? options.password : 'anonymous@';
+  this.options.secure = options.secure || false;
+  this.options.secureOptions = options.secureOptions;
+  this.options.connTimeout = options.connTimeout || 10000;
+  this.options.pasvTimeout = options.pasvTimeout || 10000;
+  this.options.aliveTimeout = options.keepalive || 10000;
+
+  if (typeof options.debug === 'function') {
+    this._debug = options.debug;
   }
 
-  this.resParser = new ResponseParser();
-
-  this.authenticated = false;
-  this.socket = Net.createConnection(port, host, firstAction || NOOP);
-
-  this.socket.on('connect', this.reemit('connect'));
-  this.socket.on('timeout', this.reemit('timeout'));
-
-  this.pipeline = duplexer(this.socket, this.resParser);
-
-  this.socket.pipe(this.resParser);
-
-  this.pipeline.on('data', function(data) {
-    self.emit('data', data);
-    dbgRespond(data.text);
-    self.parseResponse(data);
-  });
-  this.pipeline.on('error', this.reemit('error'));
-};
-
-FTP.prototype.parseResponse = function(response) {
-  if (this.commandQueue.length === 0) {
-    return;
-  }
-
-  if ([220].indexOf(response.code) > -1) {
-    return;
-  }
-
-  var next = this.commandQueue[0].callback;
-
-  if (response.isMark) {
-    // If we receive a Mark and it is not expected, we ignore that command
-    if (!next.expectsMark
-      || next.expectsMark.marks.indexOf(response.code) === -1) {
-      return;
-    }
-
-    // We might have to ignore the command that comes after the mark.
-    if (next.expectsMark.ignore) {
-      this.ignoreCmdCode = next.expectsMark.ignore;
-    }
-  }
-
-  if (this.ignoreCmdCode === response.code) {
-    this.ignoreCmdCode = null;
-
-    return;
-  }
-
-  this.parse(response, this.commandQueue.shift());
-};
-
-/**
- * Sends a new command to the server.
- *
- * @param {String} command Command to write in the FTP socket
- */
-FTP.prototype.send = function(command) {
-  if (!command) return;
-
-  dbgCommand(command);
-
-  this.pipeline.write(command + '\r\n');
-};
-
-FTP.prototype.nextCmd = function() {
-  var cmd = this.commandQueue[0];
-
-  if (!this.inProgress && cmd) {
-    this.send(cmd.action);
-
-    this.inProgress = true;
-  }
-};
-
-/**
- * Check whether the ftp user is authenticated at the moment of the
- * enqueing. ideally this should happen in the `push` method, just
- * before writing to the socket, but that would be complicated,
- * since we would have to 'unshift' the auth chain into the queue
- * or play the raw auth commands (that is, without enqueuing in
- * order to not mess up the queue order. ideally, that would be
- * built into the queue object. all this explanation to justify a
- * slight slopiness in the code flow.
- *
- * @param {string} action
- * @param {function} callback
- */
-FTP.prototype.execute = function(action, callback) {
-  if (this.socket && this.socket.writable) {
-    return this.runCommand(action, callback || NOOP);
-  }
-
-  var self = this;
-
-  this.authenticated = false;
-
-  this._createSocket(this.port, this.host, function() {
-    self.runCommand(action, callback || NOOP);
-  });
-};
-
-FTP.prototype.runCommand = function(action, callback) {
-  var cmd = {
-    action: action,
-    callback: callback,
-  };
-
-  if (this.authenticated || /^(feat|syst|user|pass)/.test(action)) {
-    this.commandQueue.push(cmd);
-    this.nextCmd();
-
-    return;
-  }
-
-  var self = this;
-
-  this.getFeatures(function() {
-    self.auth(self.user, self.pass, function() {
-      self.commandQueue.push(cmd);
-      self.nextCmd();
-    });
-  });
-};
-
-/**
- * Parse is called each time that a comand and a request are paired
- * together. That is, each time that there is a round trip of actions
- * between the client and the server.
- *
- * @param {Object} response Response from the server (contains text and code)
- * @param {Array} command Contains the command executed and a callback (if any)
- */
-FTP.prototype.parse = function(response, command) {
-  var error = null;
-
-  if (response.isError) {
-    error = new Error(response.text || 'Unknown FTP error.');
-    error.code = response.code;
-  }
-
-  command.callback(error, response);
-
-  this.inProgress = false;
-
-  this.nextCmd();
-};
-
-/**
- * Returns true if the current server has the requested feature.
- *
- * @param {String} feature Feature to look for
- * @return {Boolean} Whether the current server has the feature
- */
-FTP.prototype.hasFeat = function(feature) {
-  return !!feature && this.features.indexOf(feature.toLowerCase()) > -1;
-};
-
-/**
- * Returns an array of features supported by the current FTP server
- *
- * @param {String} features Server response for the 'FEAT' command
- * @return {String[]} Array of feature names
- */
-FTP.prototype._parseFeats = function(features) {
-  // Split and ignore header and footer
-  var featureLines = features.split(FTP_NEWLINE).slice(1, -1);
-
-  return featureLines
-    .map(function(feat) {
-      return feat.trim().toLowerCase();
-    })
-    .filter(function(feat) {
-      return !!feat;
-    });
-};
-
-// Below this point all the methods are action helpers for FTP that compose
-// several actions in one command
-FTP.prototype.getFeatures = function(callback) {
-  if (this.features) {
-    return callback(null, this.features);
-  }
-
-  var self = this;
-
-  this.raw('feat', function(error, response) {
-    self.features = error ? [] : self._parseFeats(response.text);
-
-    self.raw('syst', function(error, response) {
-      if (!error && response.code === 215) {
-        self.system = response.text.toLowerCase();
-      }
-
-      callback(null, self.features);
-    });
-  });
-};
-
-/**
- * Authenticates the user.
- *
- * @param {String} user Username
- * @param {String} pass Password
- * @param {Function} callback Follow-up function.
- */
-FTP.prototype.auth = function(user, pass, callback) {
-  if (this.authenticating === true) {
-    return callback(new Error('This client is already authenticating'));
-  }
-
-  var self = this;
-
-  if (!user) {
-    user = 'anonymous';
-  }
-
-  if (!pass) {
-    pass = '@anonymous';
-  }
-
-  this.authenticating = true;
-
-  self.raw('user', user, function(error, response) {
-    if (error || [230, 331, 332].indexOf(response.code) === -1) {
-      self.authenticating = false;
-
-      callback(error);
-
-      return;
-    }
-    self.raw('pass', pass, function(error, response) {
-      self.authenticating = false;
-
-      if (error) {
-        callback(error);
-      } else if ([230, 202].indexOf(response.code) > -1) {
-        self.authenticated = true;
-        self.user = user;
-        self.pass = pass;
-
-        self.raw('type', 'I', function() {
-          callback(undefined, response);
-        });
-      } else if (response.code === 332) {
-        self.raw('acct', ''); // ACCT not really supported
-      }
-    });
-  });
-};
-
-FTP.prototype.setType = function(type, callback) {
-  type = type.toUpperCase();
-
-  if (this.type === type) {
-    return callback();
-  }
-
-  var self = this;
-
-  this.raw('type', type, function(error, data) {
-    if (!error) {
-      self.type = type;
-    }
-
-    callback(error, data);
-  });
-};
-
-/**
- * Lists a folder's contents using a passive connection.
- *
- * @param {String} path Remote path for the file/folder to retrieve
- * @param {Function} callback Function to call with errors or results
- */
-FTP.prototype.list = function(path, callback) {
-  if (arguments.length === 1) {
-    callback = arguments[0];
-    path = '';
-  }
-
-  var self = this;
-  var listing = '';
-
-  callback = once(callback);
-
-  self.getPasvSocket(function(error, socket) {
-    if (error) {
-      return callback(error);
-    }
-
-    socket.setEncoding('utf8');
-
-    socket.on('data', function(data) {
-      listing += data;
-    });
-
-    self.pasvTimeout(socket, callback);
-
-    socket.once('close', function(error) {
-      callback(error, listing);
-    });
-    socket.once('error', callback);
-
-    function cmdCallback(error, response) {
-      if (error) {
-        return callback(error);
-      }
-
-      var isExpectedMark = expectedMarks.marks.some(function(mark) {
-        return mark === response.code;
-      });
-
-      if (!isExpectedMark) {
-        callback(new Error('Expected marks ' + expectedMarks.toString() + ' instead of: ' + response.text));
-      }
-    }
-
-    cmdCallback.expectsMark = expectedMarks;
-
-    self.execute('list ' + (path || ''), cmdCallback);
-  });
-};
-
-FTP.prototype.emitProgress = function(data) {
-  this.emit('progress', {
-    filename: data.filename,
-    action: data.action,
-    total: data.totalSize || 0,
-    transferred: data.socket[data.action === 'get' ? 'bytesRead' : 'bytesWritten']
-  });
-};
-
-/**
- * Depending on the number of parameters, returns the content of the specified
- * file or directly saves a file into the specified destination. In the latter
- * case, an optional callback can be provided, which will receive the error in
- * case the operation was not successful.
- *
- * @param {String} remotePath File to be retrieved from the FTP server
- * @param {Function|String} localPath Local path where we create the new file
- * @param {Function} [callback] Gets called on either success or failure
- */
-FTP.prototype.get = function(remotePath, localPath, callback) {
-  var self = this;
-  var finalCallback;
-
-  if (typeof localPath === 'function') {
-    finalCallback = once(localPath || NOOP);
-  } else {
-    callback = once(callback || NOOP);
-
-    finalCallback = function(error, socket) {
-      if (error) {
-        return callback(error);
-      }
-
-      var writeStream = fs.createWriteStream(localPath);
-
-      writeStream.on('error', callback);
-
-      socket.on('readable', function() {
-        self.emitProgress({
-          filename: remotePath,
-          action: 'get',
-          socket: socket
-        });
-      });
-
-      // This ensures that any expected outcome is handled. There is no
-      // danger of the callback being executed several times, because it is
-      // wrapped in `once`.
-      socket.on('error', callback);
-      socket.on('end', callback);
-      socket.on('close', callback);
-
-      socket.pipe(writeStream);
-    };
-  }
-
-  this.getGetSocket(remotePath, finalCallback);
-};
-
-/**
- * Returns a socket for a get (RETR) on a path. The socket is ready to be
- * streamed, but it is returned in a paused state. It is left to the user to
- * resume it.
- *
- * @param {String} path Path to the file to be retrieved
- * @param {Function} callback Function to call when finalized, with the socket
- * as a parameter
- */
-FTP.prototype.getGetSocket = function(path, callback) {
-  var self = this;
-
-  callback = once(callback);
-
-  this.getPasvSocket(function(error, socket) {
-    if (error) {
-      return cmdCallback(error);
-    }
-
-    socket.on('error', function(error) {
-      if (error.code === 'ECONNREFUSED') {
-        error.msg = 'Probably trying a PASV operation while one is in progress';
-      }
-
-      cmdCallback(error);
-    });
-
-    self.pasvTimeout(socket, cmdCallback);
-    socket.pause();
-
-    function cmdCallback(error, response) {
-      if (error) {
-        return callback(error);
-      }
-
-      if (!socket) {
-        return callback(new Error('Error when retrieving PASV socket'));
-      }
-
-      if (response.code === 125 || response.code === 150) {
-        return callback(null, socket);
-      }
-
-      return callback(new Error('Unexpected command ' + response.text));
-    }
-
-    cmdCallback.expectsMark = expectedMarks;
-
-    self.execute('retr ' + path, cmdCallback);
-  });
-};
-
-/**
- * Uploads contents on a FTP server. The `from` parameter can be a Buffer or the
- * path for a local file to be uploaded.
- *
- * @param {String|Buffer} from Contents to be uploaded.
- * @param {String} to path for the remote destination.
- * @param {Function} callback Function to execute on error or success.
- */
-FTP.prototype.put = function(from, to, callback) {
-  var self = this;
-
-  function putReadable(from, to, totalSize, callback) {
-    from.on('readable', function() {
-      self.emitProgress({
-        filename: to,
-        action: 'put',
-        socket: from,
-        totalSize: totalSize
-      });
-    });
-
-    self.getPutSocket(to, function(error, socket) {
-      if (!error) {
-        from.pipe(socket);
-      }
-    }, callback);
-  }
-
-  if (from instanceof Buffer) {
-    this.getPutSocket(to, function(error, socket) {
-      if (!error) {
-        socket.end(from);
-      }
-    }, callback);
-  } else if (typeof from === 'string') {
-    fs.stat(from, function(error, stats) {
-      if (error && error.code === 'ENOENT') {
-        return callback(new Error("Local file doesn't exist."));
-      }
-
-      if (stats.isDirectory()) {
-        return callback(new Error('Local path cannot be a directory'));
-      }
-
-      var totalSize = error ? 0 : stats.size;
-      var localFileStream = fs.createReadStream(from, { bufferSize: 4 * 1024 });
-
-      putReadable(localFileStream, to, totalSize, callback);
-    });
-  } else { // `from` is a readable stream
-    putReadable(from, to, from.size, callback);
-  }
-};
-
-FTP.prototype.getPutSocket = function(path, callback, doneCallback) {
-  if (!callback) {
-    throw new Error('A callback argument is required.');
-  }
-
-  var self = this;
-  var feedback = once(function(error, socket) {
-    if (error) {
-      callback(error);
-
-      return doneCallback(error);
-    }
-
-    return callback(null, socket);
-  });
-
-  doneCallback = once(doneCallback || NOOP);
-
-  this.getPasvSocket(function(error, socket) {
-    if (error) {
-      return feedback(error);
-    }
-
-    socket.on('close', doneCallback);
-    socket.on('error', doneCallback);
-
-    var putCallback = once(function putCallback(error, response) {
-      if (error) {
-        return feedback(error);
-      }
-
-      // Mark 150 indicates that the 'STOR' socket is ready to receive data.
-      // Anything else is not relevant.
-      if (response.code === 125 || response.code === 150) {
-        self.pasvTimeout(socket, doneCallback);
-
-        return feedback(null, socket);
-      }
-
-      return feedback(new Error('Unexpected command ' + response.text));
-    });
-
-    putCallback.expectsMark = expectedMarks;
-
-    self.execute('stor ' + path, putCallback);
-  });
-};
-
-FTP.prototype.pasvTimeout = function(socket, callback) {
-  var self = this;
-
-  socket.once('timeout', function() {
-    debug('PASV socket timeout');
-    self.emit('timeout');
-    socket.end();
-    callback(new Error('Passive socket timeout'));
-  });
-};
-
-FTP.prototype.getPasvSocket = function(callback) {
-  var self = this;
-
-  callback = once(callback || NOOP);
-
-  this.execute('pasv', function(error, response) {
-    if (error) {
-      return callback(error);
-    }
-
-    var options = getPasvPort(response.text);
-
-    if (!options) {
-      return callback(new Error('Bad passive host/port combination'));
-    }
-
-    var socket = self._pasvSocket = Net.createConnection(options);
-
-    socket.setTimeout(self.timeout || TIMEOUT);
-    socket.once('close', function() {
-      self._pasvSocket = undefined;
-    });
-
-    callback(null, socket);
-  });
-};
-
-/**
- * Provides information about files. It lists a directory contents or
- * a single file and yields an array of file objects. The file objects
- * contain several properties. The main difference between this method and
- * 'list' or 'stat' is that it returns objects with the file properties
- * already parsed.
- *
- * Example of file object:
- *
- * {
- *   name: 'README.txt',
- *   type: 0,
- *   time: 996052680000,
- *   size: '2582',
- *   owner: 'sergi',
- *   group: 'staff',
- *   userPermissions: { read: true, write: true, exec: false },
- *   groupPermissions: { read: true, write: false, exec: false },
- *   otherPermissions: { read: true, write: false, exec: false }
- * }
- *
- * The constants used in the object are defined in ftpParser.js
- *
- * @param {String} filePath Path to the file or directory to list
- * @param {Function} callback Function to call with the proper data when
- * the listing is finished.
- */
-FTP.prototype.ls = function(filePath, callback) {
-  function entriesToList(error, entries) {
-    if (error) {
-      return callback(error);
-    }
-
-    ListingParser.parseFTPEntries(entries.text || entries, function(error, files) {
-      if (error) {
-        return callback(error);
-      }
-
-      files.forEach(function(file) {
-        // Normalize UTF8 doing canonical decomposition, followed by
-        // canonical Composition
-        file.name = unorm.nfc(file.name);
-      });
-
-      callback(null, files);
-    });
-  }
-
-  if (this.useList) {
-    this.list(filePath, entriesToList);
-  } else {
-    var self = this;
-
-    this.raw('stat', filePath, function(error, data) {
-      // We might be connected to a server that doesn't support the
-      // 'STAT' command, which is set as default. We use 'LIST' instead,
-      // and we set the variable `useList` to true, to avoid extra round
-      // trips to the server to check.
-      var errored = (error && (error.code === 502 || error.code === 500));
-      var isHummingbird = self.system && self.system.indexOf('hummingbird') > -1;
-
-      if (errored || isHummingbird) {
-        // Not sure if the 'hummingbird' system check ^^^ is still
-        // necessary. If they support any standards, the 500 error
-        // should have us covered. Let's leave it for now.
-        self.useList = true;
-
-        self.list(filePath, entriesToList);
+  var secureOptions;
+  var debug = this._debug;
+  var socket = new Socket();
+
+  socket.setTimeout(0);
+  socket.setKeepAlive(true);
+
+  this._parser = new Parser({ debug: debug });
+  this._parser.on('response', function(code, text) {
+    var retval = code / 100 >> 0;
+
+    if (retval === RETVAL.ERR_TEMP || retval === RETVAL.ERR_PERM) {
+      if (self._curReq) {
+        self._curReq.cb(makeError(code, text), undefined, code);
       } else {
-        entriesToList(error, data);
+        self.emit('error', makeError(code, text));
       }
-    });
-  }
-};
-
-FTP.prototype.rename = function(from, to, callback) {
-  var self = this;
-
-  this.raw('rnfr', from, function(error) {
-    if (error) {
-      return callback(error);
+    } else if (self._curReq) {
+      self._curReq.cb(undefined, text, code);
     }
 
-    self.raw('rnto', to, callback);
+    // a hack to signal we're waiting for a PASV data connection to complete
+    // first before executing any more queued requests ...
+    //
+    // also: don't forget our current request if we're expecting another
+    // terminating response ....
+    if (self._curReq && retval !== RETVAL.PRELIM) {
+      self._curReq = undefined;
+      self._send();
+    }
+
+    noopreq.cb();
   });
-};
 
-FTP.prototype.keepAlive = function(wait) {
-  var self = this;
+  if (this.options.secure) {
+    secureOptions = {};
+    secureOptions.host = this.options.host;
 
-  if (this._keepAliveInterval) {
-    clearInterval(this._keepAliveInterval);
+    for (var k in this.options.secureOptions) {
+      secureOptions[k] = this.options.secureOptions[k];
+    }
+
+    secureOptions.socket = socket;
+
+    this.options.secureOptions = secureOptions;
   }
 
-  this._keepAliveInterval = setInterval(self.raw.bind(self, 'noop'), wait || IDLE_TIME);
+  if (this.options.secure === 'implicit') {
+    this._socket = tls.connect(secureOptions, onconnect);
+  } else {
+    socket.once('connect', onconnect);
+
+    this._socket = socket;
+  }
+
+  var noopreq = {
+    cmd: 'NOOP',
+    cb: function() {
+      clearTimeout(self._keepalive);
+      self._keepalive = setTimeout(donoop, self.options.aliveTimeout);
+    }
+  };
+
+  function donoop() {
+    if (!self._socket || !self._socket.writable) {
+      clearTimeout(self._keepalive);
+    } else if (!self._curReq && self._queue.length === 0) {
+      self._curReq = noopreq;
+      debug && debug('[connection] > NOOP');
+      self._socket.write(bytesNOOP);
+    } else {
+      noopreq.cb();
+    }
+  }
+
+  function onconnect() {
+    clearTimeout(timer);
+    clearTimeout(self._keepalive);
+
+    self.connected = true;
+    // re-assign for implicit secure connections
+    self._socket = socket;
+
+    var cmd;
+
+    if (self._secstate) {
+      if (self._secstate === 'upgraded-tls' && self.options.secure === true) {
+        cmd = 'PBSZ';
+        self._send('PBSZ 0', reentry, true);
+      } else {
+        cmd = 'USER';
+        self._send('USER ' + self.options.user, reentry, true);
+      }
+    } else {
+      self._curReq = {
+        cmd: '',
+        cb: reentry
+      };
+    }
+
+    function reentry(err, text, code) {
+      if (err && (!cmd || cmd === 'USER' || cmd === 'PASS' || cmd === 'TYPE')) {
+        self.emit('error', err);
+
+        return self._socket && self._socket.end();
+      }
+
+      if ((cmd === 'AUTH TLS' && code !== 234 && self.options.secure !== true)
+        || (cmd === 'AUTH SSL' && code !== 334)
+        || (cmd === 'PBSZ' && code !== 200)
+        || (cmd === 'PROT' && code !== 200)) {
+        self.emit('error', makeError(code, 'Unable to secure connection(s)'));
+
+        return self._socket && self._socket.end();
+      }
+
+      if (!cmd) {
+        // sometimes the initial greeting can contain useful information
+        // about authorized use, other limits, etc.
+        self.emit('greeting', text);
+
+        if (self.options.secure && self.options.secure !== 'implicit') {
+          cmd = 'AUTH TLS';
+          self._send(cmd, reentry, true);
+        } else {
+          cmd = 'USER';
+          self._send('USER ' + self.options.user, reentry, true);
+        }
+      } else if (cmd === 'USER') {
+        if (code !== 230) {
+          // password required
+          if (!self.options.password
+            && self.options.password !== '') {
+            self.emit('error', makeError(code, 'Password required'));
+            return self._socket && self._socket.end();
+          }
+
+          cmd = 'PASS';
+          self._send('PASS ' + self.options.password, reentry, true);
+        } else {
+          // no password required
+          cmd = 'PASS';
+          reentry(undefined, text, code);
+        }
+      } else if (cmd === 'PASS') {
+        cmd = 'FEAT';
+        self._send(cmd, reentry, true);
+      } else if (cmd === 'FEAT') {
+        if (!err) {
+          self._feat = Parser.parseFeat(text);
+        }
+
+        cmd = 'TYPE';
+
+        self._send('TYPE I', reentry, true);
+      } else if (cmd === 'TYPE')
+        self.emit('ready');
+      else if (cmd === 'PBSZ') {
+        cmd = 'PROT';
+
+        self._send('PROT P', reentry, true);
+      } else if (cmd === 'PROT') {
+        cmd = 'USER';
+
+        self._send('USER ' + self.options.user, reentry, true);
+      } else if (cmd.substr(0, 4) === 'AUTH') {
+        if (cmd === 'AUTH TLS' && code !== 234) {
+          cmd = 'AUTH SSL';
+
+          return self._send(cmd, reentry, true);
+        } else if (cmd === 'AUTH TLS') {
+          self._secstate = 'upgraded-tls';
+        } else if (cmd === 'AUTH SSL') {
+          self._secstate = 'upgraded-ssl';
+        }
+
+        socket.removeAllListeners('data');
+        socket.removeAllListeners('error');
+
+        socket._decoder = null;
+        self._curReq = null; // prevent queue from being processed during
+        // TLS/SSL negotiation
+        secureOptions.socket = self._socket;
+        secureOptions.session = undefined;
+        socket = tls.connect(secureOptions, onconnect);
+
+        socket.setEncoding('binary');
+        socket.on('data', ondata);
+        socket.once('end', onend);
+        socket.on('error', onerror);
+      }
+    }
+  }
+
+  socket.on('data', ondata);
+
+  function ondata(chunk) {
+    debug && debug('[connection] < ' + inspect(chunk.toString('binary')));
+
+    if (self._parser) {
+      self._parser.write(chunk);
+    }
+  }
+
+  socket.on('error', onerror);
+
+  function onerror(err) {
+    clearTimeout(timer);
+    clearTimeout(self._keepalive);
+    self.emit('error', err);
+  }
+
+  socket.once('end', onend);
+
+  function onend() {
+    ondone();
+    self.emit('end');
+  }
+
+  socket.once('close', function(had_err) {
+    ondone();
+    self.emit('close', had_err);
+  });
+
+  var hasReset = false;
+
+  function ondone() {
+    if (!hasReset) {
+      hasReset = true;
+
+      clearTimeout(timer);
+      self._reset();
+    }
+  }
+
+  var timer = setTimeout(function() {
+    self.emit('error', new Error('Timeout while connecting to server'));
+    self._socket && self._socket.destroy();
+    self._reset();
+  }, this.options.connTimeout);
+
+  this._socket.connect(this.options.port, this.options.host);
+};
+
+FTP.prototype.end = function() {
+  if (this._queue.length) {
+    this._ending = true;
+  } else {
+    this._reset();
+  }
 };
 
 FTP.prototype.destroy = function() {
-  if (this._keepAliveInterval) {
-    clearInterval(this._keepAliveInterval);
-  }
-
-  if (this.socket && this.socket.writable) {
-    this.socket.end();
-  }
-
-  if (this._pasvSocket && this._pasvSocket.writable) {
-    this._pasvSocket.end();
-  }
-
-  this.resParser.end();
-
-  this.socket = undefined;
-  this._pasvSocket = undefined;
-
-  this.features = null;
-  this.authenticated = false;
+  this._reset();
 };
 
-// Node types
-FTP.NODE_TYPES = ListingParser.nodeTypes;
+// "Standard" (RFC 959) commands
+FTP.prototype.ascii = function(cb) {
+  return this._send('TYPE A', cb);
+};
+
+FTP.prototype.binary = function(cb) {
+  return this._send('TYPE I', cb);
+};
+
+FTP.prototype.abort = function(immediate, cb) {
+  if (typeof immediate === 'function') {
+    cb = immediate;
+    immediate = true;
+  }
+
+  if (immediate) {
+    this._send('ABOR', cb, true);
+  } else {
+    this._send('ABOR', cb);
+  }
+};
+
+FTP.prototype.cwd = function(path, cb, promote) {
+  this._send('CWD ' + path, function(err, text, code) {
+    if (err) {
+      return cb(err);
+    }
+
+    var m = RE_WD.exec(text);
+
+    cb(undefined, m ? m[1] : undefined);
+  }, promote);
+};
+
+FTP.prototype.delete = function(path, cb) {
+  this._send('DELE ' + path, cb);
+};
+
+FTP.prototype.site = function(cmd, cb) {
+  this._send('SITE ' + cmd, cb);
+};
+
+FTP.prototype.status = function(cb) {
+  this._send('STAT', cb);
+};
+
+FTP.prototype.rename = function(from, to, cb) {
+  var self = this;
+
+  this._send('RNFR ' + from, function(err) {
+    if (err) {
+      return cb(err);
+    }
+
+    self._send('RNTO ' + to, cb, true);
+  });
+};
+
+FTP.prototype.logout = function(cb) {
+  this._send('QUIT', cb);
+};
+
+FTP.prototype.listSafe = function(path, zcomp, cb) {
+  if (typeof path === 'string') {
+    var self = this;
+
+    // store current path
+    this.pwd(function(err, origpath) {
+      if (err) {
+        return cb(err);
+      }
+
+      // change to destination path
+      self.cwd(path, function(err) {
+        if (err) {
+          return cb(err);
+        }
+
+        // get dir listing
+        self.list(zcomp || false, function(err, list) {
+          // change back to original path
+          if (err) {
+            return self.cwd(origpath, cb);
+          }
+
+          self.cwd(origpath, function(err) {
+            if (err) return cb(err);
+
+            cb(err, list);
+          });
+        });
+      });
+    });
+  } else {
+    this.list(path, zcomp, cb);
+  }
+};
+
+FTP.prototype.list = function(path, zcomp, cb) {
+  var cmd;
+  var self = this;
+
+  if (typeof path === 'function') {
+    // list(function() {})
+    cb = path;
+    path = undefined;
+    cmd = 'LIST';
+    zcomp = false;
+  } else if (typeof path === 'boolean') {
+    // list(true, function() {})
+    cb = zcomp;
+    zcomp = path;
+    path = undefined;
+    cmd = 'LIST';
+  } else if (typeof zcomp === 'function') {
+    // list('/foo', function() {})
+    cb = zcomp;
+    cmd = 'LIST ' + path;
+    zcomp = false;
+  } else {
+    cmd = 'LIST ' + path;
+  }
+
+  this._pasv(function(err, sock) {
+    if (err) {
+      return cb(err);
+    }
+
+    if (self._queue[0] && self._queue[0].cmd === 'ABOR') {
+      sock.destroy();
+
+      return cb();
+    }
+
+    var sockerr, done = false;
+    var replies = 0;
+    var entries, buffer = '';
+    var source = sock;
+    var decoder = new StringDecoder('utf8');
+
+    if (zcomp) {
+      source = zlib.createInflate();
+
+      sock.pipe(source);
+    }
+
+    source.on('data', function(chunk) {
+      buffer += decoder.write(chunk);
+    });
+    source.once('error', function(err) {
+      if (!sock.aborting)
+        sockerr = err;
+    });
+    source.once('end', ondone);
+    source.once('close', ondone);
+
+    function ondone() {
+      if (decoder) {
+        buffer += decoder.end();
+        decoder = null;
+      }
+
+      done = true;
+
+      final();
+    }
+
+    function final() {
+      if (done && replies === 2) {
+        replies = 3;
+
+        if (sockerr) {
+          return cb(new Error('Unexpected data connection error: ' + sockerr));
+        }
+
+        if (sock.aborting) {
+          return cb();
+        }
+
+        // process received data
+        entries = buffer.split(RE_EOL);
+
+        entries.pop(); // ending EOL
+
+        var parsed = [];
+
+        for (var i = 0, len = entries.length; i < len; ++i) {
+          var parsedVal = Parser.parseListEntry(entries[i]);
+
+          if (parsedVal !== null) {
+            parsed.push(parsedVal);
+          }
+        }
+
+        if (zcomp) {
+          self._send('MODE S', function() {
+            cb(undefined, parsed);
+          }, true);
+        } else {
+          cb(undefined, parsed);
+        }
+      }
+    }
+
+    if (zcomp) {
+      self._send('MODE Z', function(err, text, code) {
+        if (err) {
+          sock.destroy();
+
+          return cb(makeError(code, 'Compression not supported'));
+        }
+
+        sendList();
+      }, true);
+    } else {
+      sendList();
+    }
+
+    function sendList() {
+      // this callback will be executed multiple times, the first is when server
+      // replies with 150 and then a final reply to indicate whether the
+      // transfer was actually a success or not
+      self._send(cmd, function(err, text, code) {
+        if (err) {
+          sock.destroy();
+
+          if (zcomp) {
+            self._send('MODE S', function() {
+              cb(err);
+            }, true);
+          } else {
+            cb(err);
+          }
+
+          return;
+        }
+
+        // some servers may not open a data connection for empty directories
+        if (++replies === 1 && code === 226) {
+          replies = 2;
+
+          sock.destroy();
+          final();
+        } else if (replies === 2) {
+          final();
+        }
+      }, true);
+    }
+  });
+};
+
+FTP.prototype.get = function(path, zcomp, cb) {
+  var self = this;
+
+  if (typeof zcomp === 'function') {
+    cb = zcomp;
+    zcomp = false;
+  }
+
+  this._pasv(function(err, sock) {
+    if (err) {
+      return cb(err);
+    }
+
+    if (self._queue[0] && self._queue[0].cmd === 'ABOR') {
+      sock.destroy();
+
+      return cb();
+    }
+
+    // modify behavior of socket events so that we can emit 'error' once for
+    // either a TCP-level error OR an FTP-level error response that we get when
+    // the socket is closed (e.g. the server ran out of space).
+    var sockerr, started = false;
+    var lastreply = false;
+    var done = false;
+    var source = sock;
+
+    if (zcomp) {
+      source = zlib.createInflate();
+
+      sock.pipe(source);
+
+      sock._emit = sock.emit;
+      sock.emit = function(ev, arg1) {
+        if (ev === 'error') {
+          if (!sockerr) {
+            sockerr = arg1;
+          }
+
+          return;
+        }
+
+        sock._emit.apply(sock, Array.prototype.slice.call(arguments));
+      };
+    }
+
+    source._emit = source.emit;
+    source.emit = function(ev, arg1) {
+      if (ev === 'error') {
+        if (!sockerr) {
+          sockerr = arg1;
+        }
+
+        return;
+      } else if (ev === 'end' || ev === 'close') {
+        if (!done) {
+          done = true;
+
+          ondone();
+        }
+
+        return;
+      }
+
+      source._emit.apply(source, Array.prototype.slice.call(arguments));
+    };
+
+    function ondone() {
+      if (done && lastreply) {
+        self._send('MODE S', function() {
+          source._emit('end');
+          source._emit('close');
+        }, true);
+      }
+    }
+
+    sock.pause();
+
+    if (zcomp) {
+      self._send('MODE Z', function(err, text, code) {
+        if (err) {
+          sock.destroy();
+
+          return cb(makeError(code, 'Compression not supported'));
+        }
+
+        sendRetr();
+      }, true);
+    } else {
+      sendRetr();
+    }
+
+    function sendRetr() {
+      // this callback will be executed multiple times, the first is when server
+      // replies with 150, then a final reply after the data connection closes
+      // to indicate whether the transfer was actually a success or not
+      self._send('RETR ' + path, function(err, text, code) {
+        if (sockerr || err) {
+          sock.destroy();
+
+          if (!started) {
+            if (zcomp) {
+              self._send('MODE S', function() {
+                cb(sockerr || err);
+              }, true);
+            } else {
+              cb(sockerr || err);
+            }
+          } else {
+            source._emit('error', sockerr || err);
+            source._emit('close', true);
+          }
+
+          return;
+        }
+
+        // server returns 125 when data connection is already open; we treat it
+        // just like a 150
+        if (code === 150 || code === 125) {
+          started = true;
+
+          cb(undefined, source);
+        } else {
+          lastreply = true;
+
+          ondone();
+        }
+      }, true);
+    }
+  });
+};
+
+FTP.prototype.put = function(input, path, zcomp, cb) {
+  this._store('STOR ' + path, input, zcomp, cb);
+};
+
+FTP.prototype.append = function(input, path, zcomp, cb) {
+  this._store('APPE ' + path, input, zcomp, cb);
+};
+
+FTP.prototype.pwd = function(cb) { // PWD is optional
+  var self = this;
+
+  this._send('PWD', function(err, text, code) {
+    if (code === 502) {
+      return self.cwd('.', function(cwderr, cwd) {
+        if (cwderr) {
+          return cb(cwderr);
+        }
+
+        if (cwd === undefined) {
+          cb(err);
+        } else {
+          cb(undefined, cwd);
+        }
+      }, true);
+    } else if (err) {
+      return cb(err);
+    }
+
+    cb(undefined, RE_WD.exec(text)[1]);
+  });
+};
+
+FTP.prototype.cdup = function(cb) { // CDUP is optional
+  var self = this;
+
+  this._send('CDUP', function(err, text, code) {
+    if (code === 502) {
+      self.cwd('..', cb, true);
+    } else {
+      cb(err);
+    }
+  });
+};
+
+FTP.prototype.mkdir = function(path, recursive, cb) { // MKD is optional
+  if (typeof recursive === 'function') {
+    cb = recursive;
+    recursive = false;
+  }
+
+  if (!recursive) {
+    this._send('MKD ' + path, cb);
+  } else {
+    var i = -1;
+    var self = this;
+    var owd, abs, dirs, dirslen;
+    var searching = true;
+
+    abs = (path[0] === '/');
+
+    var nextDir = function() {
+      if (++i === dirslen) {
+        // return to original working directory
+        return self._send('CWD ' + owd, cb, true);
+      }
+
+      if (searching) {
+        self._send('CWD ' + dirs[i], function(err, text, code) {
+          if (code === 550) {
+            searching = false;
+            --i;
+          } else if (err) {
+            // return to original working directory
+            return self._send('CWD ' + owd, function() {
+              cb(err);
+            }, true);
+          }
+
+          nextDir();
+        }, true);
+      } else {
+        self._send('MKD ' + dirs[i], function(err, text, code) {
+          if (err) {
+            // return to original working directory
+            return self._send('CWD ' + owd, function() {
+              cb(err);
+            }, true);
+          }
+
+          self._send('CWD ' + dirs[i], nextDir, true);
+        }, true);
+      }
+    };
+
+    this.pwd(function(err, cwd) {
+      if (err) {
+        return cb(err);
+      }
+
+      owd = cwd;
+
+      if (abs) {
+        path = path.substr(1);
+      }
+
+      if (path[path.length - 1] === '/') {
+        path = path.substring(0, path.length - 1);
+      }
+
+      dirs = path.split('/');
+      dirslen = dirs.length;
+
+      if (abs) {
+        self._send('CWD /', function(err) {
+          if (err)
+            return cb(err);
+          nextDir();
+        }, true);
+      } else {
+        nextDir();
+      }
+    });
+  }
+};
+
+FTP.prototype.rmdir = function(path, recursive, cb) { // RMD is optional
+  if (typeof recursive === 'function') {
+    cb = recursive;
+    recursive = false;
+  }
+
+  if (!recursive) {
+    return this._send('RMD ' + path, cb);
+  }
+
+  var self = this;
+
+  this.list(path, function(err, list) {
+    if (err) {
+      return cb(err);
+    }
+
+    var idx = 0;
+    // this function will be called once per listing entry
+    var deleteNextEntry;
+
+    deleteNextEntry = function(err) {
+      if (err) {
+        return cb(err);
+      }
+
+      if (idx >= list.length) {
+        if (list[0] && list[0].name === path) {
+          return cb(null);
+        } else {
+          return self.rmdir(path, cb);
+        }
+      }
+
+      var entry = list[idx++];
+      // get the path to the file
+      var subpath = null;
+
+      if (entry.name[0] === '/') {
+        // this will be the case when you call deleteRecursively() and pass
+        // the path to a plain file
+        subpath = entry.name;
+      } else {
+        if (path[path.length - 1] == '/') {
+          subpath = path + entry.name;
+        } else {
+          subpath = path + '/' + entry.name
+        }
+      }
+
+      // delete the entry (recursively) according to its type
+      if (entry.type === 'd') {
+        if (entry.name === "." || entry.name === "..") {
+          return deleteNextEntry();
+        }
+
+        self.rmdir(subpath, true, deleteNextEntry);
+      } else {
+        self.delete(subpath, deleteNextEntry);
+      }
+    }
+
+    deleteNextEntry();
+  });
+};
+
+FTP.prototype.system = function(cb) { // SYST is optional
+  this._send('SYST', function(err, text) {
+    if (err) {
+      return cb(err);
+    }
+
+    cb(undefined, RE_SYST.exec(text)[1]);
+  });
+};
+
+// "Extended" (RFC 3659) commands
+FTP.prototype.size = function(path, cb) {
+  var self = this;
+
+  this._send('SIZE ' + path, function(err, text, code) {
+    if (code === 502) {
+      // Note: this may cause a problem as list() is _appended_ to the queue
+      return self.list(path, function(err, list) {
+        if (err) {
+          return cb(err);
+        }
+
+        if (list.length === 1) {
+          cb(undefined, list[0].size);
+        } else {
+          // path could have been a directory and we got a listing of its
+          // contents, but here we echo the behavior of the real SIZE and
+          // return 'File not found' for directories
+          cb(new Error('File not found'));
+        }
+      }, true);
+    } else if (err) {
+      return cb(err);
+    }
+
+    cb(undefined, parseInt(text, 10));
+  });
+};
+
+FTP.prototype.lastMod = function(path, cb) {
+  var self = this;
+
+  this._send('MDTM ' + path, function(err, text, code) {
+    if (code === 502) {
+      return self.list(path, function(err, list) {
+        if (err) {
+          return cb(err);
+        }
+
+        if (list.length === 1) {
+          cb(undefined, list[0].date);
+        } else {
+          cb(new Error('File not found'));
+        }
+      }, true);
+    } else if (err) {
+      return cb(err);
+    }
+
+    var ret;
+    var val = XRegExp.exec(text, REX_TIMEVAL);
+
+    if (!val) {
+      return cb(new Error('Invalid date/time format from server'));
+    }
+
+    ret = new Date(val.year + '-' + val.month + '-' + val.date + 'T' + val.hour + ':' + val.minute + ':' + val.second);
+
+    cb(undefined, ret);
+  });
+};
+
+FTP.prototype.restart = function(offset, cb) {
+  this._send('REST ' + offset, cb);
+};
+
+// Private/Internal methods
+FTP.prototype._pasv = function(cb) {
+  var self = this;
+  var first = true;
+  var ip, port;
+
+  this._send('PASV', function reentry(err, text) {
+    if (err) {
+      return cb(err);
+    }
+
+    self._curReq = undefined;
+
+    if (first) {
+      var m = RE_PASV.exec(text);
+
+      if (!m) {
+        return cb(new Error('Unable to parse PASV server response'));
+      }
+
+      ip = m[1];
+      ip += '.';
+      ip += m[2];
+      ip += '.';
+      ip += m[3];
+      ip += '.';
+      ip += m[4];
+      port = (parseInt(m[5], 10) * 256) + parseInt(m[6], 10);
+
+      first = false;
+    }
+
+    self._pasvConnect(ip, port, function(err, sock) {
+      if (err) {
+        // try the IP of the control connection if the server was somehow
+        // misconfigured and gave for example a LAN IP instead of WAN IP over
+        // the Internet
+        if (self._socket && ip !== self._socket.remoteAddress) {
+          ip = self._socket.remoteAddress;
+
+          return reentry();
+        }
+
+        // automatically abort PASV mode
+        self._send('ABOR', function() {
+          cb(err);
+          self._send();
+        }, true);
+
+        return;
+      }
+
+      cb(undefined, sock);
+      self._send();
+    });
+  });
+};
+
+FTP.prototype._pasvConnect = function(ip, port, cb) {
+  var self = this;
+  var socket = new Socket();
+  var sockerr;
+  var timedOut = false;
+  var timer = setTimeout(function() {
+    timedOut = true;
+    socket.destroy();
+    cb(new Error('Timed out while making data connection'));
+  }, this.options.pasvTimeout);
+
+  socket.setTimeout(0);
+
+  socket.once('connect', function() {
+    self._debug && self._debug('[connection] PASV socket connected');
+
+    if (self.options.secure === true) {
+      self.options.secureOptions.socket = socket;
+      self.options.secureOptions.session = self._socket.getSession();
+      //socket.removeAllListeners('error');
+      socket = tls.connect(self.options.secureOptions);
+      //socket.once('error', onerror);
+      socket.setTimeout(0);
+    }
+
+    clearTimeout(timer);
+    self._pasvSocket = socket;
+    cb(undefined, socket);
+  });
+  socket.once('error', onerror);
+
+  function onerror(err) {
+    sockerr = err;
+  }
+
+  socket.once('end', function() {
+    clearTimeout(timer);
+  });
+  socket.once('close', function(had_err) {
+    clearTimeout(timer);
+
+    if (!self._pasvSocket && !timedOut) {
+      var errmsg = 'Unable to make data connection';
+
+      if (sockerr) {
+        errmsg += '( ' + sockerr + ')';
+        sockerr = undefined;
+      }
+
+      cb(new Error(errmsg));
+    }
+
+    self._pasvSocket = undefined;
+  });
+
+  socket.connect(port, ip);
+};
+
+FTP.prototype._store = function(cmd, input, zcomp, cb) {
+  var isBuffer = Buffer.isBuffer(input);
+
+  if (!isBuffer && input.pause !== undefined) {
+    input.pause();
+  }
+
+  if (typeof zcomp === 'function') {
+    cb = zcomp;
+    zcomp = false;
+  }
+
+  var self = this;
+
+  this._pasv(function(err, sock) {
+    if (err) {
+      return cb(err);
+    }
+
+    if (self._queue[0] && self._queue[0].cmd === 'ABOR') {
+      sock.destroy();
+
+      return cb();
+    }
+
+    var sockerr, dest = sock;
+
+    sock.once('error', function(err) {
+      sockerr = err;
+    });
+
+    if (zcomp) {
+      self._send('MODE Z', function(err, text, code) {
+        if (err) {
+          sock.destroy();
+
+          return cb(makeError(code, 'Compression not supported'));
+        }
+
+        // draft-preston-ftpext-deflate-04 says min of 8 should be supported
+        dest = zlib.createDeflate({ level: 8 });
+        dest.pipe(sock);
+        sendStore();
+      }, true);
+    } else {
+      sendStore();
+    }
+
+    function sendStore() {
+      // this callback will be executed multiple times, the first is when server
+      // replies with 150, then a final reply after the data connection closes
+      // to indicate whether the transfer was actually a success or not
+      self._send(cmd, function(err, text, code) {
+        if (sockerr || err) {
+          if (zcomp) {
+            self._send('MODE S', function() {
+              cb(sockerr || err);
+            }, true);
+          } else {
+            cb(sockerr || err);
+          }
+
+          return;
+        }
+
+        if (code === 150 || code === 125) {
+          if (isBuffer) {
+            dest.end(input);
+          } else if (typeof input === 'string') {
+            // check if input is a file path or just string data to store
+            fs.stat(input, function(err, stats) {
+              if (err) {
+                dest.end(input);
+              } else {
+                fs.createReadStream(input).pipe(dest);
+              }
+            });
+          } else {
+            input.pipe(dest);
+            input.resume();
+          }
+        } else {
+          if (zcomp) {
+            self._send('MODE S', cb, true);
+          } else {
+            cb();
+          }
+        }
+      }, true);
+    }
+  });
+};
+
+FTP.prototype._send = function(cmd, cb, promote) {
+  clearTimeout(this._keepalive);
+
+  if (cmd !== undefined) {
+    if (promote) {
+      this._queue.unshift({ cmd: cmd, cb: cb });
+    } else {
+      this._queue.push({ cmd: cmd, cb: cb });
+    }
+  }
+
+  var queueLen = this._queue.length;
+
+  if (!this._curReq && queueLen && this._socket && this._socket.readable) {
+    this._curReq = this._queue.shift();
+
+    if (this._curReq.cmd === 'ABOR' && this._pasvSocket) {
+      this._pasvSocket.aborting = true;
+    }
+
+    this._debug && this._debug('[connection] > ' + inspect(this._curReq.cmd));
+    this._socket.write(this._curReq.cmd + '\r\n');
+  } else if (!this._curReq && !queueLen && this._ending) {
+    this._reset();
+  }
+};
+
+FTP.prototype._reset = function() {
+  if (this._pasvSock && this._pasvSock.writable) {
+    this._pasvSock.end();
+  }
+
+  if (this._socket && this._socket.writable) {
+    this._socket.end();
+  }
+
+  this._socket = undefined;
+  this._pasvSock = undefined;
+  this._feat = undefined;
+  this._curReq = undefined;
+  this._secstate = undefined;
+
+  clearTimeout(this._keepalive);
+
+  this._keepalive = undefined;
+  this._queue = [];
+  this._ending = false;
+  this._parser = undefined;
+  this.options.host = undefined;
+  this.options.port = undefined;
+  this.options.user = undefined;
+  this.options.password = undefined;
+  this.options.secure = undefined;
+  this.options.connTimeout = undefined;
+  this.options.pasvTimeout = undefined;
+  this.options.keepalive = undefined;
+  this._debug = undefined;
+  this.connected = false;
+};
+
+// Utility functions
+function makeError(code, text) {
+  var err = new Error(text);
+
+  err.code = code;
+
+  return err;
+}
