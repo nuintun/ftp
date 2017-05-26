@@ -20,7 +20,7 @@ var Parser = require('./lib/parser');
 var inspect = require('util').inspect;
 var StringDecoder = require('string_decoder').StringDecoder;
 
-var REX_TIMEVAL = XRegExp.cache('^(?<year>\\d{4})(?<month>\\d{2})(?<date>\\d{2})(?<hour>\\d{2})(?<minute>\\d{2})(?<second>\\d+)(?:.\\d+)?$');
+var REX_TIMEVAL = XRegExp('^(?<year>\\d{4})(?<month>\\d{2})(?<date>\\d{2})(?<hour>\\d{2})(?<minute>\\d{2})(?<second>\\d+)(?:.\\d+)?$');
 var RE_PASV = /([\d]+),([\d]+),([\d]+),([\d]+),([-\d]+),([-\d]+)/;
 var RE_EOL = /\r?\n/g;
 var RE_WD = /"(.+)"(?: |$)/;
@@ -97,6 +97,7 @@ FTP.prototype.connect = function(options) {
   var socket = new Socket();
 
   socket.setTimeout(0);
+  socket.setNoDelay(true);
   socket.setKeepAlive(true);
 
   this._parser = new Parser({ debug: debug });
@@ -120,7 +121,7 @@ FTP.prototype.connect = function(options) {
     // terminating response ....
     if (self._curReq && retval !== RETVAL.PRELIM) {
       self._curReq = undefined;
-      
+
       self._send();
     }
 
@@ -152,7 +153,7 @@ FTP.prototype.connect = function(options) {
     cmd: 'NOOP',
     cb: function() {
       clearTimeout(self._keepalive);
-      
+
       self._keepalive = setTimeout(donoop, self.options.aliveTimeout);
     }
   };
@@ -162,7 +163,7 @@ FTP.prototype.connect = function(options) {
       clearTimeout(self._keepalive);
     } else if (!self._curReq && self._queue.length === 0) {
       self._curReq = noopreq;
-      
+
       debug && debug('[connection] > NOOP');
       self._socket.write(bytesNOOP);
     } else {
@@ -183,11 +184,11 @@ FTP.prototype.connect = function(options) {
     if (self._secstate) {
       if (self._secstate === 'upgraded-tls' && self.options.secure === true) {
         cmd = 'PBSZ';
-        
+
         self._send('PBSZ 0', reentry, true);
       } else {
         cmd = 'USER';
-        
+
         self._send('USER ' + self.options.user, reentry, true);
       }
     } else {
@@ -220,11 +221,11 @@ FTP.prototype.connect = function(options) {
 
         if (self.options.secure && self.options.secure !== 'implicit') {
           cmd = 'AUTH TLS';
-          
+
           self._send(cmd, reentry, true);
         } else {
           cmd = 'USER';
-          
+
           self._send('USER ' + self.options.user, reentry, true);
         }
       } else if (cmd === 'USER') {
@@ -237,17 +238,17 @@ FTP.prototype.connect = function(options) {
           }
 
           cmd = 'PASS';
-          
+
           self._send('PASS ' + self.options.password, reentry, true);
         } else {
           // no password required
           cmd = 'PASS';
-          
+
           reentry(undefined, text, code);
         }
       } else if (cmd === 'PASS') {
         cmd = 'FEAT';
-        
+
         self._send(cmd, reentry, true);
       } else if (cmd === 'FEAT') {
         if (!err) {
@@ -493,7 +494,7 @@ FTP.prototype.list = function(path, zcomp, cb) {
     }
 
     var sockerr;
-    var entries; 
+    var entries;
     var done = false;
     var replies = 0;
     var buffer = '';
@@ -799,7 +800,7 @@ FTP.prototype.mkdir = function(path, recursive, cb) { // MKD is optional
   } else {
     var i = -1;
     var self = this;
-    var searching = true;    
+    var searching = true;
     var owd, abs, dirs, dirslen;
 
     abs = (path[0] === '/');
@@ -1013,7 +1014,7 @@ FTP.prototype.restart = function(offset, cb) {
 
 // Private/Internal methods
 FTP.prototype._pasv = function(cb) {
-  var ip, port;  
+  var ip, port;
   var self = this;
   var first = true;
 
@@ -1070,13 +1071,13 @@ FTP.prototype._pasv = function(cb) {
 };
 
 FTP.prototype._pasvConnect = function(ip, port, cb) {
-  var sockerr;  
+  var sockerr;
   var self = this;
-  var timedOut = false;  
+  var timedOut = false;
   var socket = new Socket();
   var timer = setTimeout(function() {
     timedOut = true;
-    
+
     socket.destroy();
     cb(new Error('Timed out while making data connection'));
   }, this.options.pasvTimeout);
@@ -1089,16 +1090,16 @@ FTP.prototype._pasvConnect = function(ip, port, cb) {
     if (self.options.secure === true) {
       self.options.secureOptions.socket = socket;
       self.options.secureOptions.session = self._socket.getSession();
-      
+
       socket = tls.connect(self.options.secureOptions);
-      
+
       socket.setTimeout(0);
     }
 
     clearTimeout(timer);
-    
+
     self._pasvSocket = socket;
-    
+
     cb(undefined, socket);
   });
   socket.once('error', onerror);
