@@ -235,6 +235,7 @@ FTP.prototype.connect = function(options) {
           if (!self.options.password
             && self.options.password !== '') {
             self.emit('error', makeError(code, 'Password required'));
+
             return self._socket && self._socket.end();
           }
 
