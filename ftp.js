@@ -101,6 +101,7 @@ FTP.prototype.connect = function(options) {
   socket.setKeepAlive(true);
 
   this._parser = new Parser({ debug: debug });
+
   this._parser.on('response', function(code, text) {
     var retval = code / 100 >> 0;
 
