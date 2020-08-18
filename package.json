@@ -17,7 +17,7 @@
   },
   "homepage": "https://github.com/nuintun/ftp",
   "dependencies": {
-    "xregexp": "^3.2.0",
-    "readable-stream": "^2.3.3"
+    "xregexp": "^4.3.0",
+    "readable-stream": "^3.6.0"
   }
 }
